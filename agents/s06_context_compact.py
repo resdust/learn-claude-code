@@ -34,6 +34,8 @@ Three-layer compression pipeline so the agent can work forever:
 Key insight: "The agent can forget strategically and keep working forever."
 """
 
+import functools
+import inspect
 import json
 import os
 import subprocess
@@ -53,6 +55,32 @@ client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks."
+
+
+def _shorten_for_log(value, max_str: int = 400):
+    if isinstance(value, str) and len(value) > max_str:
+        return f"{value[:max_str]}... ({len(value)} chars total)"
+    return value
+
+
+def trace_tool(tool_name: str):
+    """调用底层 tool 前打印工具名与参数（具名）。"""
+
+    def decorator(fn):
+        sig = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            bound = sig.bind_partial(*args, **kwargs)
+            bound.apply_defaults()
+            params = {k: _shorten_for_log(v) for k, v in bound.arguments.items()}
+            print(f"> tool {tool_name}: {params}")
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
 
 THRESHOLD = 50000
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
@@ -134,6 +162,7 @@ def safe_path(p: str) -> Path:
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
+@trace_tool("bash")
 def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
@@ -146,6 +175,7 @@ def run_bash(command: str) -> str:
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
 
+@trace_tool("read_file")
 def run_read(path: str, limit: int = None) -> str:
     try:
         lines = safe_path(path).read_text().splitlines()
@@ -155,6 +185,7 @@ def run_read(path: str, limit: int = None) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+@trace_tool("write_file")
 def run_write(path: str, content: str) -> str:
     try:
         fp = safe_path(path)
@@ -164,6 +195,7 @@ def run_write(path: str, content: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+@trace_tool("edit_file")
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
         fp = safe_path(path)
@@ -176,12 +208,17 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
+@trace_tool("compact")
+def run_compact(focus: str = None) -> str:
+    return "Manual compression requested."
+
+
 TOOL_HANDLERS = {
     "bash":       lambda **kw: run_bash(kw["command"]),
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    "compact":    lambda **kw: "Manual compression requested.",
+    "compact":    lambda **kw: run_compact(kw.get("focus")),
 }
 
 TOOLS = [

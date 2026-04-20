@@ -35,6 +35,8 @@ Two-layer skill injection that avoids bloating the system prompt:
 Key insight: "Don't put everything in the system prompt. Load on demand."
 """
 
+import functools
+import inspect
 import os
 import re
 import subprocess
@@ -114,6 +116,31 @@ Skills available:
 {SKILL_LOADER.get_descriptions()}"""
 
 
+def _shorten_for_log(value, max_str: int = 400):
+    if isinstance(value, str) and len(value) > max_str:
+        return f"{value[:max_str]}... ({len(value)} chars total)"
+    return value
+
+
+def trace_tool(tool_name: str):
+    """调用底层 tool 前打印工具名与参数（具名）。"""
+
+    def decorator(fn):
+        sig = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            bound = sig.bind_partial(*args, **kwargs)
+            bound.apply_defaults()
+            params = {k: _shorten_for_log(v) for k, v in bound.arguments.items()}
+            print(f"> tool {tool_name}: {params}")
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
 # -- Tool implementations --
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
@@ -121,6 +148,7 @@ def safe_path(p: str) -> Path:
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
+@trace_tool("bash")
 def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
@@ -133,6 +161,7 @@ def run_bash(command: str) -> str:
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
 
+@trace_tool("read_file")
 def run_read(path: str, limit: int = None) -> str:
     try:
         lines = safe_path(path).read_text().splitlines()
@@ -142,6 +171,7 @@ def run_read(path: str, limit: int = None) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+@trace_tool("write_file")
 def run_write(path: str, content: str) -> str:
     try:
         fp = safe_path(path)
@@ -151,6 +181,7 @@ def run_write(path: str, content: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+@trace_tool("edit_file")
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
         fp = safe_path(path)
@@ -163,12 +194,17 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
+@trace_tool("load_skill")
+def run_load_skill(name: str) -> str:
+    return SKILL_LOADER.get_content(name)
+
+
 TOOL_HANDLERS = {
     "bash":       lambda **kw: run_bash(kw["command"]),
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
+    "load_skill": lambda **kw: run_load_skill(kw["name"]),
 }
 
 TOOLS = [

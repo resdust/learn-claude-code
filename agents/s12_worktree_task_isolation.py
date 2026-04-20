@@ -30,6 +30,8 @@ Tasks are the control plane and worktrees are the execution plane.
 Key insight: "Isolate by directory, coordinate by task ID."
 """
 
+import functools
+import inspect
 import json
 import os
 import re
@@ -77,6 +79,31 @@ SYSTEM = (
     "run commands in those lanes, then choose keep/remove for closeout. "
     "Use worktree_events when you need lifecycle visibility."
 )
+
+
+def _shorten_for_log(value, max_str: int = 400):
+    if isinstance(value, str) and len(value) > max_str:
+        return f"{value[:max_str]}... ({len(value)} chars total)"
+    return value
+
+
+def trace_tool(tool_name: str):
+    """调用底层 tool 前打印工具名与参数（具名）。"""
+
+    def decorator(fn):
+        sig = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            bound = sig.bind_partial(*args, **kwargs)
+            bound.apply_defaults()
+            params = {k: _shorten_for_log(v) for k, v in bound.arguments.items()}
+            print(f"> tool {tool_name}: {params}")
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 # -- EventBus: append-only lifecycle events for observability --
@@ -482,6 +509,7 @@ def safe_path(p: str) -> Path:
     return path
 
 
+@trace_tool("bash")
 def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
@@ -501,6 +529,7 @@ def run_bash(command: str) -> str:
         return "Error: Timeout (120s)"
 
 
+@trace_tool("read_file")
 def run_read(path: str, limit: int = None) -> str:
     try:
         lines = safe_path(path).read_text().splitlines()
@@ -511,6 +540,7 @@ def run_read(path: str, limit: int = None) -> str:
         return f"Error: {e}"
 
 
+@trace_tool("write_file")
 def run_write(path: str, content: str) -> str:
     try:
         fp = safe_path(path)
@@ -521,6 +551,7 @@ def run_write(path: str, content: str) -> str:
         return f"Error: {e}"
 
 
+@trace_tool("edit_file")
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
         fp = safe_path(path)
@@ -533,23 +564,83 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
+@trace_tool("task_create")
+def s12_task_create(subject: str, description: str = "") -> str:
+    return TASKS.create(subject, description)
+
+
+@trace_tool("task_list")
+def s12_task_list() -> str:
+    return TASKS.list_all()
+
+
+@trace_tool("task_get")
+def s12_task_get(task_id: int) -> str:
+    return TASKS.get(task_id)
+
+
+@trace_tool("task_update")
+def s12_task_update(task_id: int, status: str = None, owner: str = None) -> str:
+    return TASKS.update(task_id, status, owner)
+
+
+@trace_tool("task_bind_worktree")
+def s12_task_bind_worktree(task_id: int, worktree: str, owner: str = "") -> str:
+    return TASKS.bind_worktree(task_id, worktree, owner)
+
+
+@trace_tool("worktree_create")
+def s12_worktree_create(name: str, task_id: int = None, base_ref: str = "HEAD") -> str:
+    return WORKTREES.create(name, task_id, base_ref)
+
+
+@trace_tool("worktree_list")
+def s12_worktree_list() -> str:
+    return WORKTREES.list_all()
+
+
+@trace_tool("worktree_status")
+def s12_worktree_status(name: str) -> str:
+    return WORKTREES.status(name)
+
+
+@trace_tool("worktree_run")
+def s12_worktree_run(name: str, command: str) -> str:
+    return WORKTREES.run(name, command)
+
+
+@trace_tool("worktree_keep")
+def s12_worktree_keep(name: str) -> str:
+    return WORKTREES.keep(name)
+
+
+@trace_tool("worktree_remove")
+def s12_worktree_remove(name: str, force: bool = False, complete_task: bool = False) -> str:
+    return WORKTREES.remove(name, force, complete_task)
+
+
+@trace_tool("worktree_events")
+def s12_worktree_events(limit: int = 20) -> str:
+    return EVENTS.list_recent(limit)
+
+
 TOOL_HANDLERS = {
     "bash": lambda **kw: run_bash(kw["command"]),
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    "task_create": lambda **kw: TASKS.create(kw["subject"], kw.get("description", "")),
-    "task_list": lambda **kw: TASKS.list_all(),
-    "task_get": lambda **kw: TASKS.get(kw["task_id"]),
-    "task_update": lambda **kw: TASKS.update(kw["task_id"], kw.get("status"), kw.get("owner")),
-    "task_bind_worktree": lambda **kw: TASKS.bind_worktree(kw["task_id"], kw["worktree"], kw.get("owner", "")),
-    "worktree_create": lambda **kw: WORKTREES.create(kw["name"], kw.get("task_id"), kw.get("base_ref", "HEAD")),
-    "worktree_list": lambda **kw: WORKTREES.list_all(),
-    "worktree_status": lambda **kw: WORKTREES.status(kw["name"]),
-    "worktree_run": lambda **kw: WORKTREES.run(kw["name"], kw["command"]),
-    "worktree_keep": lambda **kw: WORKTREES.keep(kw["name"]),
-    "worktree_remove": lambda **kw: WORKTREES.remove(kw["name"], kw.get("force", False), kw.get("complete_task", False)),
-    "worktree_events": lambda **kw: EVENTS.list_recent(kw.get("limit", 20)),
+    "task_create": lambda **kw: s12_task_create(kw["subject"], kw.get("description", "")),
+    "task_list": lambda **kw: s12_task_list(),
+    "task_get": lambda **kw: s12_task_get(kw["task_id"]),
+    "task_update": lambda **kw: s12_task_update(kw["task_id"], kw.get("status"), kw.get("owner")),
+    "task_bind_worktree": lambda **kw: s12_task_bind_worktree(kw["task_id"], kw["worktree"], kw.get("owner", "")),
+    "worktree_create": lambda **kw: s12_worktree_create(kw["name"], kw.get("task_id"), kw.get("base_ref", "HEAD")),
+    "worktree_list": lambda **kw: s12_worktree_list(),
+    "worktree_status": lambda **kw: s12_worktree_status(kw["name"]),
+    "worktree_run": lambda **kw: s12_worktree_run(kw["name"], kw["command"]),
+    "worktree_keep": lambda **kw: s12_worktree_keep(kw["name"]),
+    "worktree_remove": lambda **kw: s12_worktree_remove(kw["name"], kw.get("force", False), kw.get("complete_task", False)),
+    "worktree_events": lambda **kw: s12_worktree_events(kw.get("limit", 20)),
 }
 
 TOOLS = [

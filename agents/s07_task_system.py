@@ -22,6 +22,8 @@ Each task has a dependency graph (blockedBy).
 Key insight: "State that survives compression -- because it's outside the conversation."
 """
 
+import functools
+import inspect
 import json
 import os
 import subprocess
@@ -41,6 +43,31 @@ MODEL = os.environ["MODEL_ID"]
 TASKS_DIR = WORKDIR / ".tasks"
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use task tools to plan and track work."
+
+
+def _shorten_for_log(value, max_str: int = 400):
+    if isinstance(value, str) and len(value) > max_str:
+        return f"{value[:max_str]}... ({len(value)} chars total)"
+    return value
+
+
+def trace_tool(tool_name: str):
+    """调用底层 tool 前打印工具名与参数（具名）。"""
+
+    def decorator(fn):
+        sig = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            bound = sig.bind_partial(*args, **kwargs)
+            bound.apply_defaults()
+            params = {k: _shorten_for_log(v) for k, v in bound.arguments.items()}
+            print(f"> tool {tool_name}: {params}")
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 # -- TaskManager: CRUD with dependency graph, persisted as JSON files --
@@ -128,6 +155,7 @@ def safe_path(p: str) -> Path:
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
+@trace_tool("bash")
 def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
@@ -140,6 +168,7 @@ def run_bash(command: str) -> str:
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
 
+@trace_tool("read_file")
 def run_read(path: str, limit: int = None) -> str:
     try:
         lines = safe_path(path).read_text().splitlines()
@@ -149,6 +178,7 @@ def run_read(path: str, limit: int = None) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+@trace_tool("write_file")
 def run_write(path: str, content: str) -> str:
     try:
         fp = safe_path(path)
@@ -158,6 +188,7 @@ def run_write(path: str, content: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+@trace_tool("edit_file")
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
         fp = safe_path(path)
@@ -170,15 +201,42 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
+@trace_tool("task_create")
+def task_tool_create(subject: str, description: str = "") -> str:
+    return TASKS.create(subject, description)
+
+
+@trace_tool("task_update")
+def task_tool_update(
+    task_id: int,
+    status: str = None,
+    addBlockedBy: list = None,
+    removeBlockedBy: list = None,
+) -> str:
+    return TASKS.update(task_id, status, addBlockedBy, removeBlockedBy)
+
+
+@trace_tool("task_list")
+def task_tool_list() -> str:
+    return TASKS.list_all()
+
+
+@trace_tool("task_get")
+def task_tool_get(task_id: int) -> str:
+    return TASKS.get(task_id)
+
+
 TOOL_HANDLERS = {
     "bash":        lambda **kw: run_bash(kw["command"]),
     "read_file":   lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file":  lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":   lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    "task_create": lambda **kw: TASKS.create(kw["subject"], kw.get("description", "")),
-    "task_update": lambda **kw: TASKS.update(kw["task_id"], kw.get("status"), kw.get("addBlockedBy"), kw.get("removeBlockedBy")),
-    "task_list":   lambda **kw: TASKS.list_all(),
-    "task_get":    lambda **kw: TASKS.get(kw["task_id"]),
+    "task_create": lambda **kw: task_tool_create(kw["subject"], kw.get("description", "")),
+    "task_update": lambda **kw: task_tool_update(
+        kw["task_id"], kw.get("status"), kw.get("addBlockedBy"), kw.get("removeBlockedBy")
+    ),
+    "task_list":   lambda **kw: task_tool_list(),
+    "task_get":    lambda **kw: task_tool_get(kw["task_id"]),
 }
 
 TOOLS = [

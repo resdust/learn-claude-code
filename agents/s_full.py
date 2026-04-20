@@ -36,6 +36,8 @@ NOT a teaching session -- this is the "put it all together" reference.
     REPL commands: /compact /tasks /team /inbox
 """
 
+import functools
+import inspect
 import json
 import os
 import re
@@ -70,6 +72,31 @@ VALID_MSG_TYPES = {"message", "broadcast", "shutdown_request",
                    "shutdown_response", "plan_approval_response"}
 
 
+def _shorten_for_log(value, max_str: int = 400):
+    if isinstance(value, str) and len(value) > max_str:
+        return f"{value[:max_str]}... ({len(value)} chars total)"
+    return value
+
+
+def trace_tool(tool_name: str):
+    """调用底层 tool 前打印工具名与参数（具名）。"""
+
+    def decorator(fn):
+        sig = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            bound = sig.bind_partial(*args, **kwargs)
+            bound.apply_defaults()
+            params = {k: _shorten_for_log(v) for k, v in bound.arguments.items()}
+            print(f"> tool {tool_name}: {params}")
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
 # === SECTION: base_tools ===
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
@@ -77,6 +104,7 @@ def safe_path(p: str) -> Path:
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
+@trace_tool("bash")
 def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
@@ -89,6 +117,7 @@ def run_bash(command: str) -> str:
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
 
+@trace_tool("read_file")
 def run_read(path: str, limit: int = None) -> str:
     try:
         lines = safe_path(path).read_text().splitlines()
@@ -98,6 +127,7 @@ def run_read(path: str, limit: int = None) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+@trace_tool("write_file")
 def run_write(path: str, content: str) -> str:
     try:
         fp = safe_path(path)
@@ -107,6 +137,7 @@ def run_write(path: str, content: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+@trace_tool("edit_file")
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
         fp = safe_path(path)
@@ -157,6 +188,7 @@ class TodoManager:
 
 
 # === SECTION: subagent (s04) ===
+@trace_tool("task")
 def run_subagent(prompt: str, agent_type: str = "Explore") -> str:
     sub_tools = [
         {"name": "bash", "description": "Run command.",
@@ -549,6 +581,92 @@ BG = BackgroundManager()
 BUS = MessageBus()
 TEAM = TeammateManager(BUS, TASK_MGR)
 
+
+@trace_tool("TodoWrite")
+def tool_todo_write(items: list) -> str:
+    return TODO.update(items)
+
+
+@trace_tool("load_skill")
+def tool_load_skill(name: str) -> str:
+    return SKILLS.load(name)
+
+
+@trace_tool("compress")
+def tool_compress() -> str:
+    return "Compressing..."
+
+
+@trace_tool("background_run")
+def tool_background_run(command: str, timeout: int = 120) -> str:
+    return BG.run(command, timeout)
+
+
+@trace_tool("check_background")
+def tool_check_background(task_id: str = None) -> str:
+    return BG.check(task_id)
+
+
+@trace_tool("task_create")
+def tool_task_create(subject: str, description: str = "") -> str:
+    return TASK_MGR.create(subject, description)
+
+
+@trace_tool("task_get")
+def tool_task_get(task_id: int) -> str:
+    return TASK_MGR.get(task_id)
+
+
+@trace_tool("task_update")
+def tool_task_update(
+    task_id: int,
+    status: str = None,
+    add_blocked_by: list = None,
+    remove_blocked_by: list = None,
+) -> str:
+    return TASK_MGR.update(task_id, status, add_blocked_by, remove_blocked_by)
+
+
+@trace_tool("task_list")
+def tool_task_list() -> str:
+    return TASK_MGR.list_all()
+
+
+@trace_tool("spawn_teammate")
+def tool_spawn_teammate(name: str, role: str, prompt: str) -> str:
+    return TEAM.spawn(name, role, prompt)
+
+
+@trace_tool("list_teammates")
+def tool_list_teammates() -> str:
+    return TEAM.list_all()
+
+
+@trace_tool("send_message")
+def tool_send_message(to: str, content: str, msg_type: str = "message") -> str:
+    return BUS.send("lead", to, content, msg_type)
+
+
+@trace_tool("read_inbox")
+def tool_read_inbox() -> str:
+    return json.dumps(BUS.read_inbox("lead"), indent=2)
+
+
+@trace_tool("broadcast")
+def tool_broadcast(content: str) -> str:
+    return BUS.broadcast("lead", content, TEAM.member_names())
+
+
+@trace_tool("idle")
+def tool_idle() -> str:
+    return "Lead does not idle."
+
+
+@trace_tool("claim_task")
+def tool_claim_task(task_id: int) -> str:
+    return TASK_MGR.claim(task_id, "lead")
+
+
 # === SECTION: system_prompt ===
 SYSTEM = f"""You are a coding agent at {WORKDIR}. Use tools to solve tasks.
 Prefer task_create/task_update/task_list for multi-step work. Use TodoWrite for short checklists.
@@ -557,6 +675,7 @@ Skills: {SKILLS.descriptions()}"""
 
 
 # === SECTION: shutdown_protocol (s10) ===
+@trace_tool("shutdown_request")
 def handle_shutdown_request(teammate: str) -> str:
     req_id = str(uuid.uuid4())[:8]
     shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
@@ -564,6 +683,7 @@ def handle_shutdown_request(teammate: str) -> str:
     return f"Shutdown request {req_id} sent to '{teammate}'"
 
 # === SECTION: plan_approval (s10) ===
+@trace_tool("plan_approval")
 def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
     req = plan_requests.get(request_id)
     if not req: return f"Error: Unknown plan request_id '{request_id}'"
@@ -579,25 +699,27 @@ TOOL_HANDLERS = {
     "read_file":        lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file":       lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":        lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    "TodoWrite":        lambda **kw: TODO.update(kw["items"]),
+    "TodoWrite":        lambda **kw: tool_todo_write(kw["items"]),
     "task":             lambda **kw: run_subagent(kw["prompt"], kw.get("agent_type", "Explore")),
-    "load_skill":       lambda **kw: SKILLS.load(kw["name"]),
-    "compress":         lambda **kw: "Compressing...",
-    "background_run":   lambda **kw: BG.run(kw["command"], kw.get("timeout", 120)),
-    "check_background": lambda **kw: BG.check(kw.get("task_id")),
-    "task_create":      lambda **kw: TASK_MGR.create(kw["subject"], kw.get("description", "")),
-    "task_get":         lambda **kw: TASK_MGR.get(kw["task_id"]),
-    "task_update":      lambda **kw: TASK_MGR.update(kw["task_id"], kw.get("status"), kw.get("add_blocked_by"), kw.get("remove_blocked_by")),
-    "task_list":        lambda **kw: TASK_MGR.list_all(),
-    "spawn_teammate":   lambda **kw: TEAM.spawn(kw["name"], kw["role"], kw["prompt"]),
-    "list_teammates":   lambda **kw: TEAM.list_all(),
-    "send_message":     lambda **kw: BUS.send("lead", kw["to"], kw["content"], kw.get("msg_type", "message")),
-    "read_inbox":       lambda **kw: json.dumps(BUS.read_inbox("lead"), indent=2),
-    "broadcast":        lambda **kw: BUS.broadcast("lead", kw["content"], TEAM.member_names()),
+    "load_skill":       lambda **kw: tool_load_skill(kw["name"]),
+    "compress":         lambda **kw: tool_compress(),
+    "background_run":   lambda **kw: tool_background_run(kw["command"], kw.get("timeout", 120)),
+    "check_background": lambda **kw: tool_check_background(kw.get("task_id")),
+    "task_create":      lambda **kw: tool_task_create(kw["subject"], kw.get("description", "")),
+    "task_get":         lambda **kw: tool_task_get(kw["task_id"]),
+    "task_update":      lambda **kw: tool_task_update(
+        kw["task_id"], kw.get("status"), kw.get("add_blocked_by"), kw.get("remove_blocked_by")
+    ),
+    "task_list":        lambda **kw: tool_task_list(),
+    "spawn_teammate":   lambda **kw: tool_spawn_teammate(kw["name"], kw["role"], kw["prompt"]),
+    "list_teammates":   lambda **kw: tool_list_teammates(),
+    "send_message":     lambda **kw: tool_send_message(kw["to"], kw["content"], kw.get("msg_type", "message")),
+    "read_inbox":       lambda **kw: tool_read_inbox(),
+    "broadcast":        lambda **kw: tool_broadcast(kw["content"]),
     "shutdown_request": lambda **kw: handle_shutdown_request(kw["teammate"]),
     "plan_approval":    lambda **kw: handle_plan_review(kw["request_id"], kw["approve"], kw.get("feedback", "")),
-    "idle":             lambda **kw: "Lead does not idle.",
-    "claim_task":       lambda **kw: TASK_MGR.claim(kw["task_id"], "lead"),
+    "idle":             lambda **kw: tool_idle(),
+    "claim_task":       lambda **kw: tool_claim_task(kw["task_id"]),
 }
 
 TOOLS = [

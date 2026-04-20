@@ -35,6 +35,8 @@ identity re-injection after context compression. Builds on s10's protocols.
 Key insight: "The agent finds work itself."
 """
 
+import functools
+import inspect
 import json
 import os
 import subprocess
@@ -61,6 +63,32 @@ POLL_INTERVAL = 5
 IDLE_TIMEOUT = 60
 
 SYSTEM = f"You are a team lead at {WORKDIR}. Teammates are autonomous -- they find work themselves."
+
+
+def _shorten_for_log(value, max_str: int = 400):
+    if isinstance(value, str) and len(value) > max_str:
+        return f"{value[:max_str]}... ({len(value)} chars total)"
+    return value
+
+
+def trace_tool(tool_name: str):
+    """调用底层 tool 前打印工具名与参数（具名）。"""
+
+    def decorator(fn):
+        sig = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            bound = sig.bind_partial(*args, **kwargs)
+            bound.apply_defaults()
+            params = {k: _shorten_for_log(v) for k, v in bound.arguments.items()}
+            print(f"> tool {tool_name}: {params}")
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
 
 VALID_MSG_TYPES = {
     "message",
@@ -388,6 +416,7 @@ def _safe_path(p: str) -> Path:
     return path
 
 
+@trace_tool("bash")
 def _run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot"]
     if any(d in command for d in dangerous):
@@ -403,6 +432,7 @@ def _run_bash(command: str) -> str:
         return "Error: Timeout (120s)"
 
 
+@trace_tool("read_file")
 def _run_read(path: str, limit: int = None) -> str:
     try:
         lines = _safe_path(path).read_text().splitlines()
@@ -413,6 +443,7 @@ def _run_read(path: str, limit: int = None) -> str:
         return f"Error: {e}"
 
 
+@trace_tool("write_file")
 def _run_write(path: str, content: str) -> str:
     try:
         fp = _safe_path(path)
@@ -423,6 +454,7 @@ def _run_write(path: str, content: str) -> str:
         return f"Error: {e}"
 
 
+@trace_tool("edit_file")
 def _run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
         fp = _safe_path(path)
@@ -436,6 +468,7 @@ def _run_edit(path: str, old_text: str, new_text: str) -> str:
 
 
 # -- Lead-specific protocol handlers --
+@trace_tool("shutdown_request")
 def handle_shutdown_request(teammate: str) -> str:
     req_id = str(uuid.uuid4())[:8]
     with _tracker_lock:
@@ -447,6 +480,7 @@ def handle_shutdown_request(teammate: str) -> str:
     return f"Shutdown request {req_id} sent to '{teammate}'"
 
 
+@trace_tool("plan_approval")
 def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
     with _tracker_lock:
         req = plan_requests.get(request_id)
@@ -461,9 +495,45 @@ def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> st
     return f"Plan {req['status']} for '{req['from']}'"
 
 
+@trace_tool("shutdown_response")
 def _check_shutdown_status(request_id: str) -> str:
     with _tracker_lock:
         return json.dumps(shutdown_requests.get(request_id, {"error": "not found"}))
+
+
+@trace_tool("spawn_teammate")
+def _tool_spawn_teammate(name: str, role: str, prompt: str) -> str:
+    return TEAM.spawn(name, role, prompt)
+
+
+@trace_tool("list_teammates")
+def _tool_list_teammates() -> str:
+    return TEAM.list_all()
+
+
+@trace_tool("send_message")
+def _tool_send_message(to: str, content: str, msg_type: str = "message") -> str:
+    return BUS.send("lead", to, content, msg_type)
+
+
+@trace_tool("read_inbox")
+def _tool_read_inbox() -> str:
+    return json.dumps(BUS.read_inbox("lead"), indent=2)
+
+
+@trace_tool("broadcast")
+def _tool_broadcast(content: str) -> str:
+    return BUS.broadcast("lead", content, TEAM.member_names())
+
+
+@trace_tool("idle")
+def _tool_idle() -> str:
+    return "Lead does not idle."
+
+
+@trace_tool("claim_task")
+def _tool_claim_task(task_id: int) -> str:
+    return claim_task(task_id, "lead")
 
 
 # -- Lead tool dispatch (14 tools) --
@@ -472,16 +542,16 @@ TOOL_HANDLERS = {
     "read_file":         lambda **kw: _run_read(kw["path"], kw.get("limit")),
     "write_file":        lambda **kw: _run_write(kw["path"], kw["content"]),
     "edit_file":         lambda **kw: _run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    "spawn_teammate":    lambda **kw: TEAM.spawn(kw["name"], kw["role"], kw["prompt"]),
-    "list_teammates":    lambda **kw: TEAM.list_all(),
-    "send_message":      lambda **kw: BUS.send("lead", kw["to"], kw["content"], kw.get("msg_type", "message")),
-    "read_inbox":        lambda **kw: json.dumps(BUS.read_inbox("lead"), indent=2),
-    "broadcast":         lambda **kw: BUS.broadcast("lead", kw["content"], TEAM.member_names()),
+    "spawn_teammate":    lambda **kw: _tool_spawn_teammate(kw["name"], kw["role"], kw["prompt"]),
+    "list_teammates":    lambda **kw: _tool_list_teammates(),
+    "send_message":      lambda **kw: _tool_send_message(kw["to"], kw["content"], kw.get("msg_type", "message")),
+    "read_inbox":        lambda **kw: _tool_read_inbox(),
+    "broadcast":         lambda **kw: _tool_broadcast(kw["content"]),
     "shutdown_request":  lambda **kw: handle_shutdown_request(kw["teammate"]),
     "shutdown_response": lambda **kw: _check_shutdown_status(kw.get("request_id", "")),
     "plan_approval":     lambda **kw: handle_plan_review(kw["request_id"], kw["approve"], kw.get("feedback", "")),
-    "idle":              lambda **kw: "Lead does not idle.",
-    "claim_task":        lambda **kw: claim_task(kw["task_id"], "lead"),
+    "idle":              lambda **kw: _tool_idle(),
+    "claim_task":        lambda **kw: _tool_claim_task(kw["task_id"]),
 }
 
 # these base tools are unchanged from s02
